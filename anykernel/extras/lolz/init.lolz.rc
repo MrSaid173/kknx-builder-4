@@ -1,0 +1,6 @@
+# LOLZ tweaks (порт из LOLZ-V24 для KKNX): только настройка дисплея.
+# Из оригинального init.lolz.rc убрана запись метки "LOLZ KERNEL IS THE BEST" в /data/vendor.
+
+on property:vendor.post_boot.parsed=1
+    # Image Enhancement
+    write /sys/devices/virtual/graphics/fb0/msm_fb_dispparam "0010"

@@ -1,0 +1,10 @@
+# LOLZ-порт, режим full. Только то, чего в kuro439_defconfig нет.
+# Уже включены в kuro439_defconfig и поэтому НЕ в списке: MEMBARRIER, UTS_NS, BLK_CGROUP, CFS_BANDWIDTH, OVERLAY_FS.
+# OVERLAY_FS по вашему запросу не трогается (NoMount вместо него).
+# CONFIG_HZ_180 is not set
+CONFIG_HZ_300=y
+CONFIG_HZ=300
+# BPF_JIT в этом дереве зависит от MODULES
+CONFIG_MODULES=y
+CONFIG_BPF_JIT=y
+CONFIG_CRYPTO_ZSTD=y

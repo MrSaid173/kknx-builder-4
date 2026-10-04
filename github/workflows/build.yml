@@ -1,0 +1,369 @@
+name: Build KKNX kernel (mi439)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_freqs:
+        description: "GPU, МГц, 5 уровней сверху вниз. 904 = как в KKNX/Kuroneko (PLL 1808, максимум). PLL = 2 x частота"
+        default: "904,560,510,400,320"
+      gpu_pll_mhz:
+        description: "ТОЛЬКО для контрольной сборки: PLL верхнего уровня GPU, МГц. 1808 + первая частота 800 = точная копия KKNX-800Mhz_v2. Обычно пусто"
+        default: ""
+      toolchain:
+        description: "Компилятор: ubuntu_cruel (по умолчанию: clang Ubuntu + binutils/gcc автора), ubuntu_clang16 (всё из Ubuntu), neutron (как у автора, дольше, не проверен)"
+        type: choice
+        options: [ubuntu_cruel, ubuntu_clang16, neutron]
+        default: ubuntu_cruel
+      root:
+        description: "Root: resukisu_susfs = ReSukiSU + SUSFS (по умолчанию), none = без root. Оригинального KernelSU больше нет"
+        type: choice
+        options: [resukisu_susfs, none]
+        default: resukisu_susfs
+      resukisu_ref:
+        description: "ReSukiSU: пусто = последний релиз со страницы Releases (с пре-релизами, сейчас v4.2.0-rc3): ядро под тот менеджер, который можно скачать. beta = под бета-менеджер приложения, head = последний коммит main, либо тег, ветка или полный SHA"
+        default: ""
+      susfs_ref:
+        description: "SUSFS (wxx9248/susfs4ksu): тег, ветка или полный SHA. Пусто = последний коммит ветки kernel-4.9-v2"
+        default: ""
+      nomount:
+        description: "Встроить NoMount (только при root = resukisu_susfs)"
+        type: boolean
+        default: true
+      nomount_ref:
+        description: "NoMount (maxsteeel/nomount): тег, ветка или полный SHA. Пусто = последний коммит основной ветки"
+        default: ""
+      lolz_port:
+        description: "Порт LOLZ: off = нет; lite = память в DT (CMA 64 МБ, ADSP 16 МБ, без mem_dump), bootargs LOLZ, init.lolz.rc; full = lite + HZ 300, BPF_JIT (+MODULES), zstd для zram"
+        type: choice
+        options: [lite, full, off]
+        default: lite
+      lolz_panel:
+        description: "Порт LOLZ: панели экрана как у LOLZ (60 Гц, ESD-контроль у nvt36525b; в KKNX экран разогнан до 76/65 Гц). Выкл = экран как в KKNX. Работает при lolz_port = lite/full"
+        type: boolean
+        default: true
+      livedisplay:
+        description: "Прошить Dummy LiveDisplay sysfs HAL (как отдельный zip, после ядра)"
+        type: boolean
+        default: true
+      fixlabels:
+        description: "Выполнить fixlabels (метки /data/data, /data/user_de/0, /data/misc/profiles/cur/0) последним шагом установки"
+        type: boolean
+        default: true
+      localversion:
+        description: "Суффикс версии ядра (uname -r)"
+        default: "-KKNX-V3.x.x"
+      kernel_ref:
+        description: "Коммит/ветка danya2271/kernel_xiaomi_sdm439 (по умолчанию тот, из которого собран ваш бинарник)"
+        default: "124dcdc99803b53eb082f36cbe95e483df3c1ce6"
+      defconfig:
+        description: "defconfig (kuro439 = конфиг KKNX: DT overlay, wireguard, LOCALVERSION -KKNX-V3.x.x)"
+        default: "kuro439_defconfig"
+      io_sched:
+        description: "Твик: планировщик I/O. cfq (по умолчанию: вес blkio для фона/переднего плана, как в Android; cfq+deadline собираются), deadline, keep = noop как раньше"
+        type: choice
+        options: [cfq, deadline, keep]
+        default: cfq
+      default_gov:
+        description: "Твик: governor по умолчанию. schedutil (по умолчанию; без этого, если прошивка не выставит свой, CPU остаётся в performance), keep = performance как в defconfig"
+        type: choice
+        options: [schedutil, keep]
+        default: schedutil
+      cpu_boost:
+        description: "Твик: драйвер cpu_boost: короткий (80 мс) подъём минимальной частоты при касании экрана. Работает с любым governor"
+        type: boolean
+        default: true
+      zram_comp:
+        description: "Твик: алгоритм zram по умолчанию. lz4 (по умолчанию: быстрее, меньше нагрузка на A53), zstd (плотнее сжимает, но дороже по CPU), lzo, keep = как после порта LOLZ. Если прошивка сама задаёт алгоритм, это поле ничего не меняет"
+        type: choice
+        options: [lz4, zstd, lzo, keep]
+        default: lz4
+      net_cc:
+        description: "Твик: TCP BBR по умолчанию + fq. Заметно только на отдаче (upload, раздача), в 4.9 нужен fq. keep (по умолчанию) = westwood как раньше"
+        type: choice
+        options: [keep, bbr]
+        default: keep
+      lmk:
+        description: "Твик: kernel = встроенный LMK как раньше (по умолчанию); psi = PSI вместо него, только для прошивок с lmkd на PSI (Android 10+). НЕ ПРОВЕРЕНО на железе: при несовместимости нет убийцы процессов"
+        type: choice
+        options: [kernel, psi]
+        default: kernel
+      cc_opt:
+        description: "Твик компилятора: inline = убрать -inline-threshold=1 и -unroll-threshold=1 (штатные пороги clang: быстрее, образ больше), keep = как у автора"
+        type: choice
+        options: [keep, inline]
+        default: keep
+      spf:
+        description: "Твик: Speculative Page Fault (page fault без mmap_sem: быстрее запуск многопоточных приложений). В defconfig автора выключен, НЕ ПРОВЕРЕНО на железе"
+        type: boolean
+        default: false
+      runtime_tune:
+        description: "Твик: что писать в init.kknx.rc после загрузки. Группы через запятую: io (eMMC), vm (swappiness/page-cluster), sched (schedutil rate limit, iowait boost), boost (частоты cpu_boost). Удалите лишнее; пусто = файла нет (кроме net_cc=bbr: тогда одна строка про fq)"
+        default: "io,vm,sched,boost"
+
+env:
+  KERNEL_REPO: https://github.com/danya2271/kernel_xiaomi_sdm439
+  CPU_QUOT_PER_MV: "2.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Зависимости
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            clang-16 lld-16 llvm-16 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            flex bison bc libssl-dev libelf-dev cpio xz-utils device-tree-compiler python3 zip patch
+
+      - name: Тулчейн
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          set -e
+          CLANG=clang-16; LLD=ld.lld-16; PFX=llvm-
+          CROSS=aarch64-linux-gnu-; CROSS32=arm-linux-gnueabihf-; SFX=-16
+          if [ "$TOOLCHAIN" = "ubuntu_cruel" ] || [ "$TOOLCHAIN" = "neutron" ]; then
+            git clone -q --depth 1 https://github.com/CruelKernel/aarch64-cruel-elf "$HOME/cruel"
+            CROSS="$HOME/cruel/bin/aarch64-cruel-elf-"
+            "${CROSS}gcc" --version | head -1
+          fi
+          if [ "$TOOLCHAIN" = "neutron" ]; then
+            # как в prepare_compiler.sh ветки: gitlab.com/kslsdsdlkf/neutron-clang (Neutron clang 16.0.0)
+            git clone -q --depth 1 https://gitlab.com/kslsdsdlkf/neutron-clang "$HOME/neutron"
+            export PATH="$HOME/neutron/bin:$PATH"
+            CLANG="$HOME/neutron/bin/clang"; LLD="$HOME/neutron/bin/ld.lld"; SFX=""
+            "$CLANG" --version | head -1
+          fi
+          {
+            echo "TC_MK=make O=out ARCH=arm64 CC=${CLANG} LD=${LLD} NM=llvm-nm${SFX} AR=llvm-ar${SFX} OBJCOPY=llvm-objcopy${SFX} OBJDUMP=llvm-objdump${SFX} STRIP=llvm-strip${SFX} CROSS_COMPILE=${CROSS} CROSS_COMPILE_ARM32=${CROSS32} HOSTCC=gcc"
+            echo "PATH=$PATH"
+          } >> "$GITHUB_ENV"
+
+      - name: Исходники ядра
+        env:
+          KERNEL_REF: ${{ inputs.kernel_ref }}
+        run: |
+          mkdir kernel && cd kernel
+          git init -q
+          git remote add origin "$KERNEL_REPO"
+          git fetch -q --depth 1 origin "$KERNEL_REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='ядро: %H %s'
+
+      - name: Фиксы дерева
+        working-directory: kernel
+        run: bash "$GITHUB_WORKSPACE/scripts/fix_tree.sh"
+
+      - name: Root-часть
+        working-directory: kernel
+        env:
+          ROOT_MODE: ${{ inputs.root }}
+          NOMOUNT: ${{ inputs.nomount }}
+          RESUKISU_REF: ${{ inputs.resukisu_ref }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SUSFS_REF: ${{ inputs.susfs_ref }}
+          NOMOUNT_REF: ${{ inputs.nomount_ref }}
+        run: |
+          export WITH_NOMOUNT=0
+          [ "$NOMOUNT" = "true" ] && WITH_NOMOUNT=1
+          export ROOT_INFO_FILE="$GITHUB_WORKSPACE/root-info.txt"
+          : > "$ROOT_INFO_FILE"
+          bash "$GITHUB_WORKSPACE/scripts/integrate_root.sh"
+
+      - name: Порт LOLZ (исходники)
+        if: ${{ inputs.lolz_port != 'off' }}
+        working-directory: kernel
+        env:
+          LOLZ_PORT: ${{ inputs.lolz_port }}
+          LOLZ_PANEL: ${{ inputs.lolz_panel }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apply_lolz_port.py" .
+          if [ "$LOLZ_PANEL" = "true" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/apply_lolz_panel.py" .
+          fi
+          if [ "$LOLZ_PORT" = "full" ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/apply_lolz_full.py" .
+          fi
+
+      - name: Тюнинг GPU / CPU
+        working-directory: kernel
+        env:
+          GPU_FREQS: ${{ inputs.gpu_freqs }}
+          GPU_TOP_PLL_MHZ: ${{ inputs.gpu_pll_mhz }}
+        run: python3 "$GITHUB_WORKSPACE/scripts/apply_tuning.py" .
+
+      - name: Твики (исходники + runtime)
+        working-directory: kernel
+        env:
+          IO_SCHED: ${{ inputs.io_sched }}
+          DEFAULT_GOV: ${{ inputs.default_gov }}
+          CPU_BOOST: ${{ inputs.cpu_boost }}
+          ZRAM_COMP: ${{ inputs.zram_comp }}
+          NET_CC: ${{ inputs.net_cc }}
+          LMK: ${{ inputs.lmk }}
+          CC_OPT: ${{ inputs.cc_opt }}
+          SPF: ${{ inputs.spf }}
+          RUNTIME_TUNE: ${{ inputs.runtime_tune }}
+          TWEAKS_OUT: ${{ github.workspace }}/tweaks
+        run: python3 "$GITHUB_WORKSPACE/scripts/apply_tweaks.py" .
+
+      - name: Конфигурация
+        working-directory: kernel
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          ROOT: ${{ inputs.root }}
+          NOMOUNT: ${{ inputs.nomount }}
+          LOLZ_PORT: ${{ inputs.lolz_port }}
+          LOCALVERSION_SFX: ${{ inputs.localversion }}
+        run: |
+          MK="$TC_MK"
+          echo "MK=$MK" >> "$GITHUB_ENV"
+          $MK "$DEFCONFIG"
+          FRAG=$(mktemp)
+          if [ "$ROOT" = "resukisu_susfs" ]; then
+            cat "$GITHUB_WORKSPACE/config/ksu.fragment" >> "$FRAG"
+            [ "$NOMOUNT" = "true" ] && echo "CONFIG_NOMOUNT=y" >> "$FRAG"
+          elif [ "$ROOT" = "none" ]; then
+            echo "# CONFIG_KSU is not set" >> "$FRAG"
+          fi
+          if [ "$LOLZ_PORT" = "full" ]; then
+            cat "$GITHUB_WORKSPACE/config/lolz-full.fragment" >> "$FRAG"
+          fi
+          cat "$GITHUB_WORKSPACE/tweaks/tweaks.fragment" >> "$FRAG"
+          echo "CONFIG_LOCALVERSION=\"$LOCALVERSION_SFX\"" >> "$FRAG"
+          scripts/kconfig/merge_config.sh -m -O out out/.config "$FRAG"
+          $MK olddefconfig
+          grep -E '^CONFIG_(LOCALVERSION|KSU|NOMOUNT|HZ=|HZ_300|MODULES=|BPF_JIT=|CRYPTO_ZSTD=)' out/.config || true
+          # опции должны реально примениться (olddefconfig молча отбрасывает то, что не прошло по зависимостям)
+          need=""
+          [ "$ROOT" = "resukisu_susfs" ] && need="$need CONFIG_KSU=y CONFIG_KSU_SUSFS=y"
+          [ "$ROOT" = "resukisu_susfs" ] && [ "$NOMOUNT" = "true" ] && need="$need CONFIG_NOMOUNT=y"
+          [ "$LOLZ_PORT" = "full" ] && need="$need CONFIG_HZ_300=y CONFIG_HZ=300 CONFIG_MODULES=y CONFIG_BPF_JIT=y CONFIG_CRYPTO_ZSTD=y"
+          for o in $need; do
+            grep -qx "$o" out/.config || { echo "[ОШИБКА] $o не применился после olddefconfig"; exit 1; }
+          done
+          # твики: каждая строка должна совпасть; "is not set" допускает и полное отсутствие символа (его убрали зависимости)
+          python3 "$GITHUB_WORKSPACE/scripts/check_config.py" out/.config "$GITHUB_WORKSPACE/tweaks/tweaks.need"
+
+      - name: Сборка
+        working-directory: kernel
+        run: |
+          set +e
+          $MK KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz-dtb > ../build.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::group::Первые ошибки из полного лога"
+            grep -vE 'ignoring type redefinition' ../build.log | grep -nE 'error:|\*\*\* \[|Error [0-9]|undefined|No rule|ERROR \(' | head -n 40
+            echo "::endgroup::"
+            echo "=== повтор в один поток: ошибка будет в конце ==="
+            $MK KCFLAGS="-Wno-error" -j1 Image.gz-dtb 2>&1 | grep -vE 'ignoring type redefinition|warning:' | tail -n 60
+            exit 1
+          fi
+          grep -vE 'ignoring type redefinition' ../build.log | tail -n 5
+          test -f out/arch/arm64/boot/Image.gz-dtb
+
+      - name: dtbo из исходников (панели LOLZ)
+        if: ${{ inputs.lolz_port != 'off' && inputs.lolz_panel }}
+        working-directory: kernel
+        run: |
+          # оверлеи панелей собраны из тех же исходников, что и базовые DTB (правка в apply_lolz_panel.py)
+          $MK dtbo.img 2>&1 | tail -n 3
+          test -s out/arch/arm64/boot/dtbo.img
+
+      - name: Проверка результата
+        env:
+          GPU_FREQS: ${{ inputs.gpu_freqs }}
+          GPU_TOP_PLL_MHZ: ${{ inputs.gpu_pll_mhz }}
+          EXPECT_DTBS: "15"
+          LOLZ_PORT: ${{ inputs.lolz_port }}
+          LOLZ_PANEL: ${{ inputs.lolz_panel }}
+          TWEAK_MARKERS: ${{ github.workspace }}/tweaks/tweaks.markers
+        run: |
+          DTBO=""
+          [ "$LOLZ_PORT" != "off" ] && [ "$LOLZ_PANEL" = "true" ] && DTBO=kernel/out/arch/arm64/boot/dtbo.img
+          python3 scripts/verify_image.py kernel/out/arch/arm64/boot/Image.gz-dtb $DTBO
+
+      - name: Упаковка AnyKernel3
+        env:
+          GPU_FREQS: ${{ inputs.gpu_freqs }}
+          GPU_TOP_PLL_MHZ: ${{ inputs.gpu_pll_mhz }}
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          ROOT: ${{ inputs.root }}
+          NOMOUNT: ${{ inputs.nomount }}
+          LOLZ_PORT: ${{ inputs.lolz_port }}
+          LOLZ_PANEL: ${{ inputs.lolz_panel }}
+          LIVEDISPLAY: ${{ inputs.livedisplay }}
+          FIXLABELS: ${{ inputs.fixlabels }}
+        run: |
+          rm -rf ak && cp -r anykernel ak
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb ak/
+
+          # dtbo: с панелями LOLZ берём собранный из исходников, иначе готовый dtbo KKNX (anykernel/dtbo.img) без изменений
+          PANEL=0
+          if [ "$LOLZ_PORT" != "off" ] && [ "$LOLZ_PANEL" = "true" ]; then
+            PANEL=1
+            cp kernel/out/arch/arm64/boot/dtbo.img ak/dtbo.img
+          fi
+          [ "$LOLZ_PORT" = "off" ] && rm -rf ak/extras/lolz
+          [ "$LIVEDISPLAY" = "true" ] || rm -rf ak/extras/livedisplay
+          # runtime-твики: init.kknx.rc есть, только если хоть одна группа включена (или нужен fq для BBR)
+          TUNE=0
+          if [ -s tweaks/init.kknx.rc ]; then
+            TUNE=1
+            mkdir -p ak/extras/kknx
+            cp tweaks/init.kknx.rc ak/extras/kknx/init.kknx.rc
+          fi
+          rmdir ak/extras 2>/dev/null || true
+
+          # флаги для установщика (anykernel.sh читает их при прошивке)
+          {
+            echo "KK_LOLZ=$LOLZ_PORT"
+            echo "KK_LIVEDISPLAY=$([ "$LIVEDISPLAY" = "true" ] && echo 1 || echo 0)"
+            echo "KK_FIXLABELS=$([ "$FIXLABELS" = "true" ] && echo 1 || echo 0)"
+            echo "KK_TUNE=$TUNE"
+          } > ak/kknx-flags.sh
+
+          GMAX="${GPU_FREQS%%,*}"
+          TAGS="lolz-${LOLZ_PORT}"
+          [ "$PANEL" = "1" ] && TAGS="$TAGS-panel"
+          [ "$ROOT" = "none" ] && TAGS="$TAGS-noroot"
+          [ "$LIVEDISPLAY" = "true" ] && TAGS="$TAGS-ld"
+          [ "$FIXLABELS" = "true" ] && TAGS="$TAGS-fl"
+          NAME="KKNX-gpu${GMAX}-${TAGS}-$(date +%Y%m%d-%H%M).zip"
+          ( cd ak && zip -qr9 "../$NAME" . -x '.git*' )
+          {
+            echo "kernel: $(git -C kernel rev-parse HEAD)"
+            echo "gpu_freqs: $GPU_FREQS  top_pll: ${GPU_TOP_PLL_MHZ:-auto}"
+            echo "toolchain: $TOOLCHAIN"
+            echo "root: $ROOT  nomount: $NOMOUNT"
+            cat root-info.txt
+            echo "lolz_port: $LOLZ_PORT  lolz_panel: $PANEL  livedisplay: $LIVEDISPLAY  fixlabels: $FIXLABELS"
+            cat ak/kknx-flags.sh
+            echo "--- твики ---"
+            cat tweaks/tweaks-info.txt
+            echo "Image.gz-dtb: $(stat -c%s kernel/out/arch/arm64/boot/Image.gz-dtb) байт"
+          } > build-info.txt
+          cat build-info.txt
+          # итог запуска: какой менеджер нужен к этому ядру
+          {
+            echo "### Менеджер ReSukiSU"
+            grep -E '^(resukisu_version|manager):' root-info.txt || echo "root отключён (root = none)"
+            echo
+            echo "### build-info.txt"
+            echo '```'
+            cat build-info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ZIP=$NAME" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: |
+            ${{ env.ZIP }}
+            build-info.txt
+            build.log
+          retention-days: 30
