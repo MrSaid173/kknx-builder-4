@@ -1,0 +1,133 @@
+name: Recon KKNX (разведка дерева ядра, без сборки)
+
+# Ничего не компилирует (кроме DTB). Отдаёт артефакт kknx-recon с данными о дереве ядра.
+# Положить в репозиторий как .github/workflows/recon.yml. Время: ~5-10 минут.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Коммит/ветка danya2271/kernel_xiaomi_sdm439"
+        default: "124dcdc99803b53eb082f36cbe95e483df3c1ce6"
+      defconfig:
+        description: "defconfig"
+        default: "kuro439_defconfig"
+
+env:
+  KERNEL_REPO: https://github.com/danya2271/kernel_xiaomi_sdm439
+
+jobs:
+  recon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Зависимости
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            clang-16 lld-16 llvm-16 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            flex bison bc libssl-dev libelf-dev device-tree-compiler python3 xz-utils
+
+      - name: Исходники ядра
+        env:
+          KERNEL_REF: ${{ inputs.kernel_ref }}
+        run: |
+          mkdir kernel && cd kernel
+          git init -q
+          git remote add origin "$KERNEL_REPO"
+          git fetch -q --depth 80 origin "$KERNEL_REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='ядро: %H %s'
+
+      - name: Разведка
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+        run: |
+          set +e +o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          R="$GITHUB_WORKSPACE/recon"; mkdir -p "$R"
+          S="$R/summary.txt"
+          sec() { printf '\n\n===== %s =====\n' "$*" >> "$S"; }
+          MK="make O=out ARCH=arm64 CC=clang-16 LD=ld.lld-16 NM=llvm-nm-16 AR=llvm-ar-16 OBJCOPY=llvm-objcopy-16 OBJDUMP=llvm-objdump-16 STRIP=llvm-strip-16 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabihf- HOSTCC=gcc"
+
+          sec "версия и последние коммиты"
+          { head -5 Makefile; git log --format='%h %ad %s' --date=short -80; } >> "$S" 2>&1
+
+          sec "флаги компилятора (Makefile, arch/arm64/Makefile)"
+          grep -nE 'mllvm|-O[0-3s]\b|mtune|mcpu|march|LTO|LLVMgold|CLANG|stack-protector|ld\.lld|-Wl,' Makefile arch/arm64/Makefile >> "$S" 2>&1
+
+          sec "defconfig-файлы в arch/arm64/configs (похожие на наш)"
+          mkdir -p "$R/defconfigs"
+          for f in $(ls arch/arm64/configs | grep -iE 'olive|439|pine|kuro|stock|429'); do
+            echo "$f" >> "$S"; cp "arch/arm64/configs/$f" "$R/defconfigs/"
+          done
+
+          # полный .config после defconfig
+          $MK "$DEFCONFIG" > "$R/make-defconfig.log" 2>&1; echo "make defconfig rc=$?" >> "$S"
+          $MK olddefconfig > "$R/make-olddefconfig.log" 2>&1; echo "make olddefconfig rc=$?" >> "$S"
+          cp out/.config "$R/config.full" 2>/dev/null
+
+          # все символы Kconfig в дереве + их состояние в .config
+          grep -rIoE --include='Kconfig*' --exclude-dir=out --exclude-dir=.git '^(menu)?config [A-Za-z0-9_]+' . 2>/dev/null \
+            | sed -E 's#^\./([^:]+):(menu)?config ([A-Za-z0-9_]+)#\3 \1#' | sort -u > "$R/all-symbols.txt"
+          awk 'NR==FNR{ if(substr($0,1,7)=="CONFIG_"){i=index($0,"="); c[substr($0,8,i-8)]=substr($0,i+1)} else if($0 ~ /^# CONFIG_[A-Za-z0-9_]+ is not set$/){c[substr($2,8)]="n"} next } { v=($1 in c)?c[$1]:"-"; print $1"\t"v"\t"$2 }' \
+            out/.config "$R/all-symbols.txt" > "$R/symbols-state.tsv"
+          RX='BOOST|BWMON|DEVFREQ|CPU_FREQ|CPUFREQ|GOV|SCHED|WALT|HMP|CASS|LPM|CPU_IDLE|CPUIDLE|THERMAL|LMK|LOWMEM|PSI|ZRAM|ZSMALLOC|ZSWAP|ZPOOL|LZ4|ZSTD|LZO|BFQ|CFQ|DEADLINE|KYBER|NOOP|IOSCHED|ENERGY|SPECULATIVE|THP|TRANSPARENT|CMA|KSM|COMPACT|PREEMPT|NO_HZ|HZ_|RCU|TCP_CONG|NET_SCH|MMC|CMDQ|KGSL|ADRENO|IRQ|DEBUG|TRACE|TRACING|STACKPROTECTOR|HARDEN|FORTIFY|TTBR0|RANDOMIZE|SECCOMP|KPROBE|PROFILING|PERF_EVENTS|IPC_LOG|CORESIGHT|RTB|DUMP|PAGE_OWNER|LOCKUP|HUNG|WATCHDOG|SYSRQ|PANIC|PM_|SUSPEND|WAKELOCK|AUTOSLEEP|ISOLATION|CORE_CTL|MSM_PERFORMANCE|CPR|FS_ENCRYPTION|F2FS'
+          awk -F'\t' -v rx="$RX" '$1 ~ rx' "$R/symbols-state.tsv" > "$R/symbols-interesting.tsv"
+
+          # ключевые слова по исходникам (один проход)
+          KW='adrenoboost|adreno_idler|deep_nap|idle_timer|bw_hwmon|bwmon|cpu_input_boost|devfreq_boost|sched_boost|sched_walt|cass|schedtune|uclamp|simple_lmk|lowmemorykiller|psi_trigger|zsmalloc|zram_writeback|max_comp_streams|lz4hc|zstd_version|mq-deadline|bfq|kyber|cmdq|fiops|sio|maple|speculative|lru_gen|zswap|ksm|cleancache|frontswap|tcp_bbr|wireguard|core_ctl|msm_performance|cpu_boost|cpufreq_times|energy_model|capacity_state|busy_cost|sched_load|wake_up_idle|cpu_isolate'
+          grep -rIiowE --include='*.c' --include='*.h' --include='Kconfig*' --include='Makefile' --include='*.dtsi' \
+            "$KW" drivers kernel mm block lib crypto init arch/arm64 include net fs 2>/dev/null \
+            | sort | uniq -c | sort -rn > "$R/kw-hits.txt"
+          sec "ключевые слова: сколько файлов и примеры (полный список: kw-hits.txt)"
+          awk '{n=split($2,p,":"); k=tolower(p[n]); f[k]++; if(f[k]<=4) s[k]=s[k]" "p[1]} END{for(k in f) printf "%-22s файлов:%-4d %s\n", k, f[k], s[k]}' "$R/kw-hits.txt" | sort >> "$S"
+
+          for d in block drivers/cpufreq drivers/devfreq drivers/cpuidle drivers/block/zram drivers/staging/android kernel/sched drivers/gpu/msm drivers/soc/qcom lib/lz4 lib/zstd drivers/thermal kernel/power drivers/mmc/host; do
+            sec "ls $d"; ls "$d" 2>&1 | tr '\n' ' ' >> "$S"
+          done
+          sec "crypto: lz4/lzo/zstd"; ls crypto | grep -iE 'lz4|lzo|zstd|deflate' | tr '\n' ' ' >> "$S"
+
+          sec "lz4: версия и ускорение"
+          { grep -rnE 'LZ4_VERSION|LZ4_MEMORY_USAGE|acceleration' lib/lz4 include/linux/lz4.h | head -30; head -40 lib/lz4/lz4_compress.c; } >> "$S" 2>&1
+          sec "zstd: версия"
+          grep -rnE 'ZSTD_VERSION' lib/zstd include/linux/zstd.h | head -10 >> "$S" 2>&1
+          sec "zram: возможности"
+          grep -nE 'max_comp_streams|writeback|dedup|backing_dev|use_dedup|same_pages|default_compressor|comp_algorithm' drivers/block/zram/zram_drv.c | head -40 >> "$S" 2>&1
+          sec "schedutil: тюнабл-параметры"
+          grep -nE 'rate_limit|iowait_boost|hispeed|up_rate|down_rate|schedutil_' kernel/sched/cpufreq_schedutil.c | head -60 >> "$S" 2>&1
+          sec "sched features.h"
+          cat kernel/sched/features.h >> "$S" 2>&1
+          sec "cpu-boost: параметры модуля"
+          grep -nE 'module_param|input_boost|sched_boost' drivers/cpufreq/cpu-boost.c | head -40 >> "$S" 2>&1
+          sec "kgsl: pwrscale/pwrctrl (idle, boost, deep nap)"
+          grep -nE 'idle_timer|deep_nap|adrenoboost|min_pwrlevel|throttl|boost' drivers/gpu/msm/kgsl_pwrscale.c drivers/gpu/msm/kgsl_pwrctrl.c | head -80 >> "$S" 2>&1
+          sec "dts: файлы с bwmon / cpr / lpm"
+          { grep -rlE 'bw-hwmon|bwmon' arch/arm64/boot/dts/qcom | head -20; echo ---; grep -rlE 'qcom,lpm-levels' arch/arm64/boot/dts/qcom | head -10; } >> "$S" 2>&1
+
+          # исходники для чтения в чате
+          SRC=""
+          for p in kernel/sched drivers/cpufreq drivers/devfreq drivers/cpuidle drivers/soc/qcom drivers/gpu/msm drivers/block/zram drivers/staging/android drivers/thermal block mm lib/lz4 lib/zstd kernel/power drivers/mmc/core drivers/mmc/host/sdhci-msm.c drivers/mmc/host/cmdq_hci.c arch/arm64/kernel/topology.c arch/arm64/kernel/cpuidle.c; do
+            [ -e "$p" ] && SRC="$SRC $p"
+          done
+          tar -cJf "$R/src-key.tar.xz" $SRC $(ls crypto/*lz4* crypto/*zstd* crypto/*lzo* 2>/dev/null) 2>/dev/null
+          tar -cJf "$R/dts-src.tar.xz" arch/arm64/boot/dts/qcom 2>/dev/null
+
+          # собранные и расшифрованные DTB: тут итоговые таблицы частот, CPR, шины, GPU
+          $MK -j"$(nproc)" dtbs > "$R/make-dtbs.log" 2>&1; echo "make dtbs rc=$?" >> "$S"
+          mkdir -p "$R/dts-decompiled"
+          for f in out/arch/arm64/boot/dts/qcom/*.dtb out/arch/arm64/boot/dts/qcom/*.dtbo; do
+            [ -f "$f" ] || continue
+            dtc -I dtb -O dts -o "$R/dts-decompiled/$(basename "$f").dts" "$f" 2>/dev/null
+          done
+          ls out/arch/arm64/boot/dts/qcom/ 2>/dev/null | tr '\n' ' ' >> "$S"
+          tar -cJf "$R/dts-decompiled.tar.xz" -C "$R" dts-decompiled && rm -rf "$R/dts-decompiled"
+
+          ls -la "$R"; du -sh "$R"
+
+      - name: Артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: kknx-recon
+          path: recon/
+          retention-days: 14
